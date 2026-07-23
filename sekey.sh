@@ -9,6 +9,7 @@ TRUE=/usr/bin/true
 SC_AUTH=
 TEMP_DIR=
 IDENTITIES_FILE=
+SSH_IDENTITIES_FILE=
 MATCH_FILE=
 
 usage() {
@@ -22,7 +23,7 @@ Options:
   -l, --list-keys               List non-exportable CTK identities
   -c, --generate-keypair LABEL  Generate a Touch ID-protected keypair
   -d, --delete-keypair HASH     Delete a keypair after confirmation
-  -e, --export-key HASH         Print an OpenSSH public key
+  -e, --export-key HASH         Print an OpenSSH public key via ssh-agent
   -a, --add-to-agent            Add all SSH-compatible keys to ssh-agent
 
 HASH is the 40-character hash shown by --list-keys. Export and agent
@@ -95,6 +96,17 @@ capture_identities() {
 	fi
 }
 
+capture_ssh_identities() {
+	make_temp_dir
+	SSH_IDENTITIES_FILE=$TEMP_DIR/ssh-identities
+	"$SC_AUTH" list-ctk-identities -t ssh >"$SSH_IDENTITIES_FILE"
+	capture_status=$?
+	if [ "$capture_status" -ne 0 ]; then
+		error 'could not list SSH fingerprints for CTK identities'
+		return "$capture_status"
+	fi
+}
+
 validate_hash() {
 	HASH=$1
 	case $HASH in
@@ -118,6 +130,38 @@ find_identity() {
 		}
 		END { exit matches == 1 ? 0 : 1 }
 	' "$IDENTITIES_FILE" >"$MATCH_FILE"
+}
+
+find_ssh_fingerprint() {
+	capture_ssh_identities || return $?
+
+	if ! SSH_FINGERPRINT=$(awk -v hash="$HASH" '
+		function signature(    value, field) {
+			value = $1
+			for (field = 3; field <= NF; field++)
+				value = value SUBSEP $field
+			return value
+		}
+		FNR == NR {
+			if (FNR > 1 && $1 == "p-256-ne" && toupper($2) == hash) {
+				selected_signature = signature()
+				selected++
+			}
+			next
+		}
+		FNR > 1 && signature() == selected_signature {
+			print $2
+			matches++
+		}
+		END { exit selected == 1 && matches == 1 ? 0 : 1 }
+	' "$IDENTITIES_FILE" "$SSH_IDENTITIES_FILE"); then
+		return 1
+	fi
+
+	case $SSH_FINGERPRINT in
+		SHA256:?*) return 0 ;;
+		*) return 1 ;;
+	esac
 }
 
 list_keys() {
@@ -187,42 +231,82 @@ delete_keypair() {
 	return "$delete_status"
 }
 
-ssh_hashes() {
-	awk '
-		$1 == "p-256-ne" &&
-		length($2) == 40 && $2 ~ /^[0123456789abcdefABCDEF]+$/ &&
-		!seen[toupper($2)]++ {
-			if (hashes != "")
-				hashes = hashes ";"
-			hashes = hashes toupper($2)
-		}
-		END { print hashes }
-	' "$IDENTITIES_FILE"
+require_agent() {
+	require_provider
+	[ -x "$SSH_ADD" ] || fail "required command not found: $SSH_ADD"
+	[ -x "$SSH_KEYGEN" ] || fail "required command not found: $SSH_KEYGEN"
+	[ -n "${SSH_AUTH_SOCK:-}" ] || fail 'SSH_AUTH_SOCK is not set'
+}
+
+load_agent_keys() {
+	if [ "${1:-}" = quiet ]; then
+		SSH_ASKPASS_REQUIRE=force \
+		SSH_ASKPASS=$TRUE \
+			"$SSH_ADD" -q -K -S "$PROVIDER"
+		return $?
+	fi
+
+	SSH_ASKPASS_REQUIRE=force \
+	SSH_ASKPASS=$TRUE \
+		"$SSH_ADD" -K -S "$PROVIDER"
+}
+
+capture_agent_keys() {
+	AGENT_KEYS_FILE=$TEMP_DIR/agent-keys
+	AGENT_ERROR_FILE=$TEMP_DIR/agent-error
+	"$SSH_ADD" -L >"$AGENT_KEYS_FILE" 2>"$AGENT_ERROR_FILE"
+	agent_status=$?
+	case $agent_status in
+		0) return 0 ;;
+		1)
+			: >"$AGENT_KEYS_FILE"
+			return 0
+			;;
+		*)
+			cat "$AGENT_ERROR_FILE" >&2
+			return "$agent_status"
+			;;
+	esac
+}
+
+find_agent_public_key() {
+	AGENT_MATCH_FILE=$TEMP_DIR/agent-match
+	CANDIDATE_FILE=$TEMP_DIR/candidate.pub
+	FINGERPRINT_FILE=$TEMP_DIR/candidate.fingerprint
+	: >"$AGENT_MATCH_FILE"
+
+	while IFS= read -r public_key; do
+		[ -n "$public_key" ] || continue
+		printf '%s\n' "$public_key" >"$CANDIDATE_FILE"
+		if "$SSH_KEYGEN" -E sha256 -lf "$CANDIDATE_FILE" \
+			>"$FINGERPRINT_FILE" 2>/dev/null; then
+			candidate_fingerprint=$(awk 'NR == 1 { print $2 }' \
+				"$FINGERPRINT_FILE")
+			if [ "$candidate_fingerprint" = "$SSH_FINGERPRINT" ]; then
+				printf '%s\n' "$public_key" >>"$AGENT_MATCH_FILE"
+			fi
+		fi
+	done <"$AGENT_KEYS_FILE"
+
+	agent_matches=$(awk 'END { print NR + 0 }' "$AGENT_MATCH_FILE")
+	case $agent_matches in
+		1) return 0 ;;
+		0) return 1 ;;
+		*) return 2 ;;
+	esac
 }
 
 add_to_agent() {
 	require_macos
-	require_sc_auth
-	require_provider
-	[ -x "$SSH_ADD" ] || fail "required command not found: $SSH_ADD"
-	[ -n "${SSH_AUTH_SOCK:-}" ] || fail 'SSH_AUTH_SOCK is not set'
-	capture_identities || exit $?
-
-	SSH_HASHES=$(ssh_hashes)
-	[ -n "$SSH_HASHES" ] || fail 'no SSH-compatible p-256-ne identities found'
-
-	KEYCHAIN_CERTIFICATES=$SSH_HASHES \
-	SSH_ASKPASS_REQUIRE=force \
-	SSH_ASKPASS=$TRUE \
-		"$SSH_ADD" -K -S "$PROVIDER"
+	require_agent
+	load_agent_keys
 }
 
 export_key() {
 	validate_hash "$1"
 	require_macos
 	require_sc_auth
-	require_provider
-	[ -x "$SSH_KEYGEN" ] || fail "required command not found: $SSH_KEYGEN"
+	require_agent
 	capture_identities || exit $?
 
 	if ! find_identity p-256-ne; then
@@ -232,44 +316,29 @@ export_key() {
 		fail "no non-exportable identity found for hash $HASH"
 	fi
 
-	EXPORT_DIR=$TEMP_DIR/export
-	DOWNLOAD_OUTPUT=$TEMP_DIR/ssh-keygen.out
-	mkdir "$EXPORT_DIR" || fail 'could not prepare temporary export storage'
-
-	(
-		cd "$EXPORT_DIR" || exit 1
-		KEYCHAIN_CERTIFICATES=$HASH \
-		SSH_ASKPASS_REQUIRE=force \
-		SSH_ASKPASS=$TRUE \
-			"$SSH_KEYGEN" -q -K -w "$PROVIDER" -N '' \
-			</dev/null >"$DOWNLOAD_OUTPUT"
-	)
-	export_status=$?
-	if [ "$export_status" -ne 0 ]; then
-		[ ! -s "$DOWNLOAD_OUTPUT" ] || cat "$DOWNLOAD_OUTPUT" >&2
-		error "could not export identity $HASH"
-		return "$export_status"
+	if ! find_ssh_fingerprint; then
+		fail "could not map identity $HASH to an SSH fingerprint"
 	fi
 
-	set -- "$EXPORT_DIR"/*.pub
-	if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
-		fail 'the SSH provider did not return exactly one public key'
+	capture_agent_keys || return $?
+	find_agent_public_key
+	match_status=$?
+	if [ "$match_status" -eq 2 ]; then
+		fail "ssh-agent contains multiple entries for $SSH_FINGERPRINT"
 	fi
-	PUBLIC_KEY_FILE=$1
-	KEY_HANDLE_FILE=${PUBLIC_KEY_FILE%.pub}
-	[ -f "$KEY_HANDLE_FILE" ] || fail 'the SSH provider returned an incomplete key'
-
-	if ! awk '
-		NR == 1 && $1 == "sk-ecdsa-sha2-nistp256@openssh.com" && NF >= 2 {
-			valid = 1
-		}
-		NR > 1 { valid = 0 }
-		END { exit valid ? 0 : 1 }
-	' "$PUBLIC_KEY_FILE"; then
-		fail 'the SSH provider returned an invalid public key'
+	if [ "$match_status" -eq 1 ]; then
+		load_agent_keys quiet || return $?
+		capture_agent_keys || return $?
+		find_agent_public_key
+		match_status=$?
+		case $match_status in
+			0) ;;
+			1) fail "SSH provider did not add identity $HASH to ssh-agent" ;;
+			2) fail "ssh-agent contains multiple entries for $SSH_FINGERPRINT" ;;
+		esac
 	fi
 
-	cat "$PUBLIC_KEY_FILE"
+	cat "$AGENT_MATCH_FILE"
 }
 
 if [ "$#" -eq 0 ]; then
