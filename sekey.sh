@@ -8,10 +8,6 @@ SSH_KEYGEN=/usr/bin/ssh-keygen
 TRUE=/usr/bin/true
 
 TEMP_DIR=
-IDENTITIES_FILE=
-SSH_IDENTITIES_FILE=
-IDENTITY_MAP_FILE=
-MATCH_FILE=
 
 usage() {
 	cat <<EOF
@@ -61,13 +57,11 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-require_macos() {
+preflight() {
 	if [ "$(/usr/bin/uname -s 2>/dev/null)" != Darwin ]; then
 		fail 'this operation requires macOS'
 	fi
-}
 
-require_supported_version() {
 	macos_version=$(/usr/bin/sw_vers -productVersion 2>/dev/null) ||
 		fail 'could not determine the macOS version'
 	macos_major=${macos_version%%.*}
@@ -78,46 +72,28 @@ require_supported_version() {
 	esac
 	[ "$macos_major" -ge 26 ] ||
 		fail "macOS 26 or newer is required (found $macos_version)"
-}
 
-require_unprivileged_user() {
 	user_id=$(/usr/bin/id -u 2>/dev/null) || fail 'could not determine user ID'
 	if [ "$user_id" -eq 0 ] || [ -n "${SUDO_USER:-}" ] ||
 		[ -n "${SUDO_UID:-}" ]; then
 		fail 'do not run this script as root or with sudo'
 	fi
-}
 
-make_temp_dir() {
-	[ -n "$TEMP_DIR" ] && return 0
-	TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/sekey.XXXXXXXX") ||
-		fail 'could not create a temporary directory'
+	[ -x "$SC_AUTH" ] || fail "required Apple command not found: $SC_AUTH"
 }
 
 capture_identities() {
-	make_temp_dir
-	IDENTITIES_FILE=$TEMP_DIR/identities
-	"$SC_AUTH" list-ctk-identities >"$IDENTITIES_FILE"
+	if [ -z "$TEMP_DIR" ]; then
+		TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/sekey.XXXXXXXX") ||
+			fail 'could not create a temporary directory'
+	fi
+
+	"$SC_AUTH" list-ctk-identities >"$TEMP_DIR/identities"
 	capture_status=$?
 	if [ "$capture_status" -ne 0 ]; then
 		error 'could not list CTK identities'
 		return "$capture_status"
 	fi
-}
-
-capture_ssh_identities() {
-	make_temp_dir
-	SSH_IDENTITIES_FILE=$TEMP_DIR/ssh-identities
-	"$SC_AUTH" list-ctk-identities -t ssh >"$SSH_IDENTITIES_FILE"
-	return $?
-}
-
-preflight() {
-	require_macos
-	require_supported_version
-	require_unprivileged_user
-	[ -x "$SC_AUTH" ] || fail "required Apple command not found: $SC_AUTH"
-	capture_identities || exit $?
 }
 
 validate_hash() {
@@ -134,7 +110,6 @@ validate_hash() {
 
 find_identity() {
 	find_type=$1
-	MATCH_FILE=$TEMP_DIR/match
 	awk -v hash="$HASH" -v type="$find_type" '
 		toupper($2) == hash &&
 		((type == "non-exportable" && $1 ~ /-ne$/) || $1 == type) {
@@ -142,13 +117,13 @@ find_identity() {
 			matches++
 		}
 		END { exit matches == 1 ? 0 : 1 }
-	' "$IDENTITIES_FILE" >"$MATCH_FILE"
+	' "$TEMP_DIR/identities" >"$TEMP_DIR/match"
 }
 
 build_identity_map() {
-	IDENTITY_MAP_FILE=$TEMP_DIR/identity-map
-	: >"$IDENTITY_MAP_FILE"
-	capture_ssh_identities || return $?
+	: >"$TEMP_DIR/identity-map"
+	"$SC_AUTH" list-ctk-identities -t ssh >"$TEMP_DIR/ssh-identities" ||
+		return $?
 
 	awk '
 		function signature(    value, field) {
@@ -182,27 +157,28 @@ build_identity_map() {
 					print hash, fingerprint
 			}
 		}
-	' "$IDENTITIES_FILE" "$SSH_IDENTITIES_FILE" >"$IDENTITY_MAP_FILE"
+	' "$TEMP_DIR/identities" "$TEMP_DIR/ssh-identities" \
+		>"$TEMP_DIR/identity-map"
 }
 
 find_ssh_fingerprint() {
 	SSH_FINGERPRINT=$(awk -v hash="$HASH" '
 		toupper($1) == hash { print $2 }
-	' "$IDENTITY_MAP_FILE")
+	' "$TEMP_DIR/identity-map")
 	case $SSH_FINGERPRINT in
 		SHA256:?*) return 0 ;;
 		*) return 1 ;;
 	esac
 }
 
-print_non_exportable_keys() {
-	awk '
+print_keys() {
+	awk -v ssh_only="$1" '
 		FILENAME == ARGV[1] {
 			fingerprint[toupper($1)] = $2
 			next
 		}
 		FNR == 1 { header = $0; next }
-		$1 ~ /-ne$/ {
+		$1 ~ /-ne$/ && (!ssh_only || $1 == "p-256-ne") {
 			if (!found)
 				print header
 			print
@@ -216,41 +192,21 @@ print_non_exportable_keys() {
 			found = 1
 		}
 		END {
-			if (!found)
-				print "No non-exportable CTK identities found."
+			if (!found) {
+				if (ssh_only)
+					print "No SSH-compatible non-exportable CTK identities found."
+				else
+					print "No non-exportable CTK identities found."
+			}
 		}
-	' "$IDENTITY_MAP_FILE" "$IDENTITIES_FILE"
-}
-
-print_ssh_compatible_keys() {
-	awk '
-		FILENAME == ARGV[1] {
-			fingerprint[toupper($1)] = $2
-			next
-		}
-		FNR == 1 { header = $0; next }
-		$1 == "p-256-ne" {
-			if (!found)
-				print header
-			print
-			if (fingerprint[toupper($2)] != "")
-				value = fingerprint[toupper($2)]
-			else
-				value = "unavailable"
-			print "  SSH fingerprint: " value
-			found = 1
-		}
-		END {
-			if (!found)
-				print "No SSH-compatible non-exportable CTK identities found."
-		}
-	' "$IDENTITY_MAP_FILE" "$IDENTITIES_FILE"
+	' "$TEMP_DIR/identity-map" "$TEMP_DIR/identities"
 }
 
 list_keys() {
 	preflight
+	capture_identities || exit $?
 	build_identity_map || :
-	print_non_exportable_keys
+	print_keys 0
 }
 
 generate_keypair() {
@@ -267,6 +223,7 @@ generate_keypair() {
 delete_keypair() {
 	validate_hash "$1"
 	preflight
+	capture_identities || exit $?
 
 	if ! find_identity non-exportable; then
 		fail "no non-exportable identity found for hash $HASH"
@@ -274,8 +231,8 @@ delete_keypair() {
 
 	build_identity_map || :
 	printf 'Identity to delete permanently:\n' >&2
-	cat "$MATCH_FILE" >&2
-	match_type=$(awk 'NR == 1 { print $1 }' "$MATCH_FILE")
+	cat "$TEMP_DIR/match" >&2
+	match_type=$(awk 'NR == 1 { print $1 }' "$TEMP_DIR/match")
 	if [ "$match_type" = p-256-ne ] && find_ssh_fingerprint; then
 		printf 'SSH fingerprint: %s\n' "$SSH_FINGERPRINT" >&2
 	elif [ "$match_type" = p-256-ne ]; then
@@ -307,75 +264,59 @@ delete_keypair() {
 }
 
 load_agent_keys() {
-	if [ "${1:-}" = quiet ]; then
-		SSH_ASKPASS_REQUIRE=force \
-		SSH_ASKPASS=$TRUE \
-			"$SSH_ADD" -q -K -S "$PROVIDER"
-		return $?
-	fi
-
 	SSH_ASKPASS_REQUIRE=force \
 	SSH_ASKPASS=$TRUE \
-		"$SSH_ADD" -K -S "$PROVIDER"
+		"$SSH_ADD" -q -K -S "$PROVIDER"
 }
 
 capture_agent_keys() {
-	AGENT_KEYS_FILE=$TEMP_DIR/agent-keys
-	AGENT_ERROR_FILE=$TEMP_DIR/agent-error
-	"$SSH_ADD" -L >"$AGENT_KEYS_FILE" 2>"$AGENT_ERROR_FILE"
+	"$SSH_ADD" -L >"$TEMP_DIR/agent-keys" 2>"$TEMP_DIR/agent-error"
 	agent_status=$?
 	case $agent_status in
 		0) return 0 ;;
 		1)
-			: >"$AGENT_KEYS_FILE"
+			: >"$TEMP_DIR/agent-keys"
 			return 0
 			;;
 		*)
-			cat "$AGENT_ERROR_FILE" >&2
+			cat "$TEMP_DIR/agent-error" >&2
 			return "$agent_status"
 			;;
 	esac
 }
 
 find_agent_public_key() {
-	AGENT_MATCH_FILE=$TEMP_DIR/agent-match
-	CANDIDATE_FILE=$TEMP_DIR/candidate.pub
-	FINGERPRINT_FILE=$TEMP_DIR/candidate.fingerprint
-	: >"$AGENT_MATCH_FILE"
+	"$SSH_KEYGEN" -E sha256 -lf "$TEMP_DIR/agent-keys" \
+		>"$TEMP_DIR/agent-fingerprints" 2>/dev/null || :
 
-	while IFS= read -r public_key; do
-		[ -n "$public_key" ] || continue
-		printf '%s\n' "$public_key" >"$CANDIDATE_FILE"
-		if "$SSH_KEYGEN" -E sha256 -lf "$CANDIDATE_FILE" \
-			>"$FINGERPRINT_FILE" 2>/dev/null; then
-			candidate_fingerprint=$(awk 'NR == 1 { print $2 }' \
-				"$FINGERPRINT_FILE")
-			if [ "$candidate_fingerprint" = "$SSH_FINGERPRINT" ]; then
-				awk 'NR == 1 { print $1, $2, "ssh:" }' \
-					"$CANDIDATE_FILE" >>"$AGENT_MATCH_FILE"
-			fi
-		fi
-	done <"$AGENT_KEYS_FILE"
-
-	agent_matches=$(awk 'END { print NR + 0 }' "$AGENT_MATCH_FILE")
-	case $agent_matches in
-		1) return 0 ;;
-		0) return 1 ;;
-		*) return 2 ;;
-	esac
+	awk -v fingerprint="$SSH_FINGERPRINT" '
+		FILENAME == ARGV[1] {
+			if ($2 == fingerprint)
+				matching_line[FNR] = 1
+			next
+		}
+		matching_line[FNR] {
+			print $1, $2, "ssh:"
+			matches++
+		}
+		END { exit matches == 1 ? 0 : matches == 0 ? 1 : 2 }
+	' "$TEMP_DIR/agent-fingerprints" "$TEMP_DIR/agent-keys" \
+		>"$TEMP_DIR/agent-match"
 }
 
 add_to_agent() {
 	preflight
-	load_agent_keys quiet || return $?
+	capture_identities || exit $?
+	load_agent_keys || return $?
 	build_identity_map || :
 	printf 'SSH-compatible CTK identities available to ssh-agent:\n'
-	print_ssh_compatible_keys
+	print_keys 1
 }
 
 export_key() {
 	validate_hash "$1"
 	preflight
+	capture_identities || exit $?
 
 	if ! find_identity p-256-ne; then
 		if find_identity non-exportable; then
@@ -398,7 +339,7 @@ export_key() {
 		fail "identity $HASH is not loaded in ssh-agent; run '$PROGRAM --add-to-agent' first (it adds all compatible identities)"
 	fi
 
-	cat "$AGENT_MATCH_FILE"
+	cat "$TEMP_DIR/agent-match"
 }
 
 if [ "$#" -eq 0 ]; then
