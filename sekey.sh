@@ -2,14 +2,15 @@
 
 PROGRAM=${0##*/}
 PROVIDER=/usr/lib/ssh-keychain.dylib
+SC_AUTH=/usr/sbin/sc_auth
 SSH_ADD=/usr/bin/ssh-add
 SSH_KEYGEN=/usr/bin/ssh-keygen
 TRUE=/usr/bin/true
 
-SC_AUTH=
 TEMP_DIR=
 IDENTITIES_FILE=
 SSH_IDENTITIES_FILE=
+IDENTITY_MAP_FILE=
 MATCH_FILE=
 
 usage() {
@@ -23,11 +24,12 @@ Options:
   -l, --list-keys               List non-exportable CTK identities
   -c, --generate-keypair LABEL  Generate a Touch ID-protected keypair
   -d, --delete-keypair HASH     Delete a keypair after confirmation
-  -e, --export-key HASH         Print an OpenSSH public key via ssh-agent
+  -e, --export-key HASH         Print a public key already in ssh-agent
   -a, --add-to-agent            Add all SSH-compatible keys to ssh-agent
 
-HASH is the 40-character hash shown by --list-keys. Export and agent
-operations support p-256-ne identities. Requires macOS 26 or newer.
+HASH is the 40-character CTK hash shown by --list-keys. Export is read-only
+and fails if the key is not already in ssh-agent. Export and agent operations
+support p-256-ne identities. Requires macOS 26 or newer. Do not run with sudo.
 EOF
 }
 
@@ -60,23 +62,30 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 require_macos() {
-	if [ "$(uname -s 2>/dev/null)" != Darwin ]; then
+	if [ "$(/usr/bin/uname -s 2>/dev/null)" != Darwin ]; then
 		fail 'this operation requires macOS'
 	fi
 }
 
-require_sc_auth() {
-	if [ -x /usr/sbin/sc_auth ]; then
-		SC_AUTH=/usr/sbin/sc_auth
-	else
-		SC_AUTH=$(command -v sc_auth 2>/dev/null) ||
-			fail 'sc_auth was not found'
-	fi
+require_supported_version() {
+	macos_version=$(/usr/bin/sw_vers -productVersion 2>/dev/null) ||
+		fail 'could not determine the macOS version'
+	macos_major=${macos_version%%.*}
+	case $macos_major in
+		'' | *[!0123456789]*)
+			fail "unsupported macOS version: $macos_version"
+			;;
+	esac
+	[ "$macos_major" -ge 26 ] ||
+		fail "macOS 26 or newer is required (found $macos_version)"
 }
 
-require_provider() {
-	[ -r "$PROVIDER" ] || fail "SSH provider not found: $PROVIDER"
-	[ -x "$TRUE" ] || fail "required command not found: $TRUE"
+require_unprivileged_user() {
+	user_id=$(/usr/bin/id -u 2>/dev/null) || fail 'could not determine user ID'
+	if [ "$user_id" -eq 0 ] || [ -n "${SUDO_USER:-}" ] ||
+		[ -n "${SUDO_UID:-}" ]; then
+		fail 'do not run this script as root or with sudo'
+	fi
 }
 
 make_temp_dir() {
@@ -100,11 +109,15 @@ capture_ssh_identities() {
 	make_temp_dir
 	SSH_IDENTITIES_FILE=$TEMP_DIR/ssh-identities
 	"$SC_AUTH" list-ctk-identities -t ssh >"$SSH_IDENTITIES_FILE"
-	capture_status=$?
-	if [ "$capture_status" -ne 0 ]; then
-		error 'could not list SSH fingerprints for CTK identities'
-		return "$capture_status"
-	fi
+	return $?
+}
+
+preflight() {
+	require_macos
+	require_supported_version
+	require_unprivileged_user
+	[ -x "$SC_AUTH" ] || fail "required Apple command not found: $SC_AUTH"
+	capture_identities || exit $?
 }
 
 validate_hash() {
@@ -132,56 +145,112 @@ find_identity() {
 	' "$IDENTITIES_FILE" >"$MATCH_FILE"
 }
 
-find_ssh_fingerprint() {
+build_identity_map() {
+	IDENTITY_MAP_FILE=$TEMP_DIR/identity-map
+	: >"$IDENTITY_MAP_FILE"
 	capture_ssh_identities || return $?
 
-	if ! SSH_FINGERPRINT=$(awk -v hash="$HASH" '
+	awk '
 		function signature(    value, field) {
 			value = $1
 			for (field = 3; field <= NF; field++)
 				value = value SUBSEP $field
 			return value
 		}
-		FNR == NR {
-			if (FNR > 1 && $1 == "p-256-ne" && toupper($2) == hash) {
-				selected_signature = signature()
-				selected++
+		FILENAME == ARGV[1] {
+			if (FNR > 1 && $1 == "p-256-ne") {
+				value = signature()
+				hash = toupper($2)
+				default_count[value]++
+				hash_count[hash]++
+				default_hash[value] = hash
 			}
 			next
 		}
-		FNR > 1 && signature() == selected_signature {
-			print $2
-			matches++
+		FNR > 1 && $1 == "p-256-ne" && $2 ~ /^SHA256:/ {
+			value = signature()
+			ssh_count[value]++
+			fingerprint_count[$2]++
+			ssh_fingerprint[value] = $2
 		}
-		END { exit selected == 1 && matches == 1 ? 0 : 1 }
-	' "$IDENTITIES_FILE" "$SSH_IDENTITIES_FILE"); then
-		return 1
-	fi
+		END {
+			for (value in default_hash) {
+				hash = default_hash[value]
+				fingerprint = ssh_fingerprint[value]
+				if (default_count[value] == 1 && ssh_count[value] == 1 &&
+				    hash_count[hash] == 1 && fingerprint_count[fingerprint] == 1)
+					print hash, fingerprint
+			}
+		}
+	' "$IDENTITIES_FILE" "$SSH_IDENTITIES_FILE" >"$IDENTITY_MAP_FILE"
+}
 
+find_ssh_fingerprint() {
+	SSH_FINGERPRINT=$(awk -v hash="$HASH" '
+		toupper($1) == hash { print $2 }
+	' "$IDENTITY_MAP_FILE")
 	case $SSH_FINGERPRINT in
 		SHA256:?*) return 0 ;;
 		*) return 1 ;;
 	esac
 }
 
-list_keys() {
-	require_macos
-	require_sc_auth
-	capture_identities || exit $?
-
+print_non_exportable_keys() {
 	awk '
-		NR == 1 { header = $0; next }
+		FILENAME == ARGV[1] {
+			fingerprint[toupper($1)] = $2
+			next
+		}
+		FNR == 1 { header = $0; next }
 		$1 ~ /-ne$/ {
 			if (!found)
 				print header
 			print
+			if ($1 != "p-256-ne")
+				value = "unavailable (not SSH-compatible)"
+			else if (fingerprint[toupper($2)] != "")
+				value = fingerprint[toupper($2)]
+			else
+				value = "unavailable"
+			print "  SSH fingerprint: " value
 			found = 1
 		}
 		END {
 			if (!found)
 				print "No non-exportable CTK identities found."
 		}
-	' "$IDENTITIES_FILE"
+	' "$IDENTITY_MAP_FILE" "$IDENTITIES_FILE"
+}
+
+print_ssh_compatible_keys() {
+	awk '
+		FILENAME == ARGV[1] {
+			fingerprint[toupper($1)] = $2
+			next
+		}
+		FNR == 1 { header = $0; next }
+		$1 == "p-256-ne" {
+			if (!found)
+				print header
+			print
+			if (fingerprint[toupper($2)] != "")
+				value = fingerprint[toupper($2)]
+			else
+				value = "unavailable"
+			print "  SSH fingerprint: " value
+			found = 1
+		}
+		END {
+			if (!found)
+				print "No SSH-compatible non-exportable CTK identities found."
+		}
+	' "$IDENTITY_MAP_FILE" "$IDENTITIES_FILE"
+}
+
+list_keys() {
+	preflight
+	build_identity_map || :
+	print_non_exportable_keys
 }
 
 generate_keypair() {
@@ -191,23 +260,29 @@ generate_keypair() {
 		-*) usage_error 'LABEL must not begin with a hyphen' ;;
 	esac
 
-	require_macos
-	require_sc_auth
+	preflight
 	"$SC_AUTH" create-ctk-identity -l "$LABEL" -k p-256-ne -t bio
 }
 
 delete_keypair() {
 	validate_hash "$1"
-	require_macos
-	require_sc_auth
-	capture_identities || exit $?
+	preflight
 
 	if ! find_identity non-exportable; then
 		fail "no non-exportable identity found for hash $HASH"
 	fi
 
+	build_identity_map || :
 	printf 'Identity to delete permanently:\n' >&2
 	cat "$MATCH_FILE" >&2
+	match_type=$(awk 'NR == 1 { print $1 }' "$MATCH_FILE")
+	if [ "$match_type" = p-256-ne ] && find_ssh_fingerprint; then
+		printf 'SSH fingerprint: %s\n' "$SSH_FINGERPRINT" >&2
+	elif [ "$match_type" = p-256-ne ]; then
+		printf 'SSH fingerprint: unavailable\n' >&2
+	else
+		printf 'SSH fingerprint: unavailable (not SSH-compatible)\n' >&2
+	fi
 	if ! printf "Type 'delete' to continue: " >/dev/tty 2>/dev/null; then
 		fail 'deletion requires an interactive terminal'
 	fi
@@ -229,13 +304,6 @@ delete_keypair() {
 
 	error "could not delete identity $HASH"
 	return "$delete_status"
-}
-
-require_agent() {
-	require_provider
-	[ -x "$SSH_ADD" ] || fail "required command not found: $SSH_ADD"
-	[ -x "$SSH_KEYGEN" ] || fail "required command not found: $SSH_KEYGEN"
-	[ -n "${SSH_AUTH_SOCK:-}" ] || fail 'SSH_AUTH_SOCK is not set'
 }
 
 load_agent_keys() {
@@ -283,7 +351,8 @@ find_agent_public_key() {
 			candidate_fingerprint=$(awk 'NR == 1 { print $2 }' \
 				"$FINGERPRINT_FILE")
 			if [ "$candidate_fingerprint" = "$SSH_FINGERPRINT" ]; then
-				printf '%s\n' "$public_key" >>"$AGENT_MATCH_FILE"
+				awk 'NR == 1 { print $1, $2, "ssh:" }' \
+					"$CANDIDATE_FILE" >>"$AGENT_MATCH_FILE"
 			fi
 		fi
 	done <"$AGENT_KEYS_FILE"
@@ -297,17 +366,16 @@ find_agent_public_key() {
 }
 
 add_to_agent() {
-	require_macos
-	require_agent
-	load_agent_keys
+	preflight
+	load_agent_keys quiet || return $?
+	build_identity_map || :
+	printf 'SSH-compatible CTK identities available to ssh-agent:\n'
+	print_ssh_compatible_keys
 }
 
 export_key() {
 	validate_hash "$1"
-	require_macos
-	require_sc_auth
-	require_agent
-	capture_identities || exit $?
+	preflight
 
 	if ! find_identity p-256-ne; then
 		if find_identity non-exportable; then
@@ -316,7 +384,7 @@ export_key() {
 		fail "no non-exportable identity found for hash $HASH"
 	fi
 
-	if ! find_ssh_fingerprint; then
+	if ! build_identity_map || ! find_ssh_fingerprint; then
 		fail "could not map identity $HASH to an SSH fingerprint"
 	fi
 
@@ -327,15 +395,7 @@ export_key() {
 		fail "ssh-agent contains multiple entries for $SSH_FINGERPRINT"
 	fi
 	if [ "$match_status" -eq 1 ]; then
-		load_agent_keys quiet || return $?
-		capture_agent_keys || return $?
-		find_agent_public_key
-		match_status=$?
-		case $match_status in
-			0) ;;
-			1) fail "SSH provider did not add identity $HASH to ssh-agent" ;;
-			2) fail "ssh-agent contains multiple entries for $SSH_FINGERPRINT" ;;
-		esac
+		fail "identity $HASH is not loaded in ssh-agent; run '$PROGRAM --add-to-agent' first (it adds all compatible identities)"
 	fi
 
 	cat "$AGENT_MATCH_FILE"
