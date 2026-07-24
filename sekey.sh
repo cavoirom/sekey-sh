@@ -17,15 +17,15 @@ Manage non-exportable SSH keypairs in Apple Secure Enclave.
 
 Options:
   -h, --help                    Show this help
-  -l, --list-keys               List non-exportable CTK identities
+  -l, --list-keys               List SSH keypairs in Apple Secure Enclave
   -c, --generate-keypair LABEL  Generate a Touch ID-protected keypair
   -d, --delete-keypair HASH     Delete a keypair after confirmation
   -e, --export-key HASH         Print a public key already in ssh-agent
-  -a, --add-to-agent            Add all SSH-compatible keys to ssh-agent
+  -a, --add-to-agent            Add all SSH-compatible keypairs to ssh-agent
 
-HASH is the 40-character CTK hash shown by --list-keys. Export is read-only
+HASH is the 40-character public key hash shown by --list-keys. Export is read-only
 and fails if the key is not already in ssh-agent. Export and agent operations
-support p-256-ne identities. Requires macOS 26 or newer. Do not run with sudo.
+support p-256-ne keypairs. Requires macOS 26 or newer. Do not run with sudo.
 EOF
 }
 
@@ -91,7 +91,7 @@ capture_identities() {
 	"$SC_AUTH" list-ctk-identities >"$TEMP_DIR/identities"
 	capture_status=$?
 	if [ "$capture_status" -ne 0 ]; then
-		error 'could not list CTK identities'
+		error 'could not list SSH keypairs'
 		return "$capture_status"
 	fi
 }
@@ -177,26 +177,27 @@ print_keys() {
 			fingerprint[toupper($1)] = $2
 			next
 		}
-		FNR == 1 { header = $0; next }
+		FNR == 1 { next }
 		$1 ~ /-ne$/ && (!ssh_only || $1 == "p-256-ne") {
-			if (!found)
-				print header
-			print
+			if (found)
+				print ""
+			print "Hash: " toupper($2)
+			print "Label: " $4
 			if ($1 != "p-256-ne")
 				value = "unavailable (not SSH-compatible)"
 			else if (fingerprint[toupper($2)] != "")
 				value = fingerprint[toupper($2)]
 			else
 				value = "unavailable"
-			print "  SSH fingerprint: " value
+			print "Fingerprint: " value
 			found = 1
 		}
 		END {
 			if (!found) {
 				if (ssh_only)
-					print "No SSH-compatible non-exportable CTK identities found."
+					print "No SSH-compatible keypairs found."
 				else
-					print "No non-exportable CTK identities found."
+					print "No SSH keypairs found."
 			}
 		}
 	' "$TEMP_DIR/identity-map" "$TEMP_DIR/identities"
@@ -309,7 +310,7 @@ add_to_agent() {
 	capture_identities || exit $?
 	load_agent_keys || return $?
 	build_identity_map || :
-	printf 'SSH-compatible CTK identities available to ssh-agent:\n'
+	printf 'SSH-compatible keypairs available to ssh-agent:\n'
 	print_keys 1
 }
 
