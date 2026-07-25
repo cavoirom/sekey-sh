@@ -24,9 +24,8 @@ Options:
   -e, --export-key HASH         Export and print a public key
   -a, --add-to-agent            Add all SSH-compatible keypairs to ssh-agent
 
-HASH is the 40-character public key hash shown by --list-keys. Export and agent
-operations support p-256-ne keypairs. Requires macOS 26 or newer. Do not run
-with sudo.
+HASH is the 40-character public key hash shown by --list-keys, is used in
+--delete-keypair, --export. Requires macOS 26 or newer. Do not run with sudo.
 EOF
 }
 
