@@ -8,6 +8,7 @@ SSH_KEYGEN=/usr/bin/ssh-keygen
 TRUE=/usr/bin/true
 
 TEMP_DIR=
+EXPORT_PID=
 
 usage() {
 	cat <<EOF
@@ -20,12 +21,12 @@ Options:
   -l, --list-keys               List SSH keypairs in Apple Secure Enclave
   -c, --generate-keypair LABEL  Generate a Touch ID-protected keypair
   -d, --delete-keypair HASH     Delete a keypair after confirmation
-  -e, --export-key HASH         Print a public key already in ssh-agent
+  -e, --export-key HASH         Export and print a public key
   -a, --add-to-agent            Add all SSH-compatible keypairs to ssh-agent
 
-HASH is the 40-character public key hash shown by --list-keys. Export is read-only
-and fails if the key is not already in ssh-agent. Export and agent operations
-support p-256-ne keypairs. Requires macOS 26 or newer. Do not run with sudo.
+HASH is the 40-character public key hash shown by --list-keys. Export and agent
+operations support p-256-ne keypairs. Requires macOS 26 or newer. Do not run
+with sudo.
 EOF
 }
 
@@ -45,6 +46,13 @@ usage_error() {
 }
 
 cleanup() {
+	cleanup_pid=$EXPORT_PID
+	EXPORT_PID=
+	if [ -n "$cleanup_pid" ]; then
+		kill "$cleanup_pid" 2>/dev/null || :
+		wait "$cleanup_pid" 2>/dev/null || :
+	fi
+
 	cleanup_dir=$TEMP_DIR
 	TEMP_DIR=
 	if [ -n "$cleanup_dir" ]; then
@@ -270,25 +278,42 @@ load_agent_keys() {
 		"$SSH_ADD" -q -K -S "$PROVIDER"
 }
 
-capture_agent_keys() {
-	"$SSH_ADD" -L >"$TEMP_DIR/agent-keys" 2>"$TEMP_DIR/agent-error"
-	agent_status=$?
-	case $agent_status in
-		0) return 0 ;;
-		1)
-			: >"$TEMP_DIR/agent-keys"
-			return 0
-			;;
-		*)
-			cat "$TEMP_DIR/agent-error" >&2
-			return "$agent_status"
-			;;
-	esac
+count_overwrite_prompts() {
+	awk '
+		BEGIN { marker = "Overwrite (y/n)? " }
+		{
+			text = $0
+			while ((position = index(text, marker)) != 0) {
+				count++
+				text = substr(text, position + length(marker))
+			}
+		}
+		END { print count + 0 }
+	' "$TEMP_DIR/ssh-keygen-output"
 }
 
-find_agent_public_key() {
-	"$SSH_KEYGEN" -E sha256 -lf "$TEMP_DIR/agent-keys" \
-		>"$TEMP_DIR/agent-fingerprints" 2>/dev/null || :
+archive_public_keys() {
+	set -- "$TEMP_DIR/export"/*.pub
+	[ -f "$1" ] || return 0
+
+	for public_key_file do
+		CANDIDATE_COUNT=$((CANDIDATE_COUNT + 1))
+		mv "$public_key_file" \
+			"$TEMP_DIR/candidates/$CANDIDATE_COUNT.pub" || return $?
+	done
+}
+
+find_exported_public_key() {
+	: >"$TEMP_DIR/exported-keys"
+	set -- "$TEMP_DIR/candidates"/*.pub
+	[ -f "$1" ] || return 1
+
+	for public_key_file do
+		cat "$public_key_file" >>"$TEMP_DIR/exported-keys" || return 3
+	done
+
+	"$SSH_KEYGEN" -E sha256 -lf "$TEMP_DIR/exported-keys" \
+		>"$TEMP_DIR/exported-fingerprints" 2>/dev/null || return 3
 
 	awk -v fingerprint="$SSH_FINGERPRINT" '
 		FILENAME == ARGV[1] {
@@ -296,13 +321,13 @@ find_agent_public_key() {
 				matching_line[FNR] = 1
 			next
 		}
-		matching_line[FNR] {
+		matching_line[FNR] && $1 == "sk-ecdsa-sha2-nistp256@openssh.com" {
 			print $1, $2, "ssh:"
 			matches++
 		}
 		END { exit matches == 1 ? 0 : matches == 0 ? 1 : 2 }
-	' "$TEMP_DIR/agent-fingerprints" "$TEMP_DIR/agent-keys" \
-		>"$TEMP_DIR/agent-match"
+	' "$TEMP_DIR/exported-fingerprints" "$TEMP_DIR/exported-keys" \
+		>"$TEMP_DIR/export-match"
 }
 
 add_to_agent() {
@@ -318,6 +343,8 @@ export_key() {
 	validate_hash "$1"
 	preflight
 	capture_identities || exit $?
+	[ -x "$SSH_KEYGEN" ] || fail "required command not found: $SSH_KEYGEN"
+	[ -r "$PROVIDER" ] || fail "SSH provider not found: $PROVIDER"
 
 	if ! find_identity p-256-ne; then
 		if find_identity non-exportable; then
@@ -330,17 +357,62 @@ export_key() {
 		fail "could not map identity $HASH to an SSH fingerprint"
 	fi
 
-	capture_agent_keys || return $?
-	find_agent_public_key
-	match_status=$?
-	if [ "$match_status" -eq 2 ]; then
-		fail "ssh-agent contains multiple entries for $SSH_FINGERPRINT"
-	fi
-	if [ "$match_status" -eq 1 ]; then
-		fail "identity $HASH is not loaded in ssh-agent; run '$PROGRAM --add-to-agent' first (it adds all compatible identities)"
+	mkdir -m 700 "$TEMP_DIR/export" "$TEMP_DIR/candidates" ||
+		fail 'could not prepare temporary export storage'
+	mkfifo "$TEMP_DIR/ssh-keygen-input" ||
+		fail 'could not prepare the SSH key export'
+	: >"$TEMP_DIR/ssh-keygen-output"
+	: >"$TEMP_DIR/ssh-keygen-error"
+
+	(
+		cd "$TEMP_DIR/export" || exit 1
+		SSH_ASKPASS_REQUIRE=force \
+		SSH_ASKPASS=$TRUE \
+			exec "$SSH_KEYGEN" -K -w "$PROVIDER" -N '' -v \
+			<"$TEMP_DIR/ssh-keygen-input" \
+			>"$TEMP_DIR/ssh-keygen-output" \
+			2>"$TEMP_DIR/ssh-keygen-error"
+	) &
+	EXPORT_PID=$!
+
+	if ! exec 3>"$TEMP_DIR/ssh-keygen-input"; then
+		fail 'could not control the SSH key export'
 	fi
 
-	cat "$TEMP_DIR/agent-match"
+	CANDIDATE_COUNT=0
+	handled_prompts=0
+	while kill -0 "$EXPORT_PID" 2>/dev/null; do
+		prompt_count=$(count_overwrite_prompts)
+		if [ "$prompt_count" -gt "$handled_prompts" ]; then
+			archive_public_keys || fail 'could not preserve an exported public key'
+			printf 'y\n' >&3 || fail 'could not continue the SSH key export'
+			handled_prompts=$((handled_prompts + 1))
+		else
+			sleep 0.1
+		fi
+	done
+
+	exec 3>&-
+	wait "$EXPORT_PID"
+	export_status=$?
+	EXPORT_PID=
+	if [ "$export_status" -ne 0 ]; then
+		[ ! -s "$TEMP_DIR/ssh-keygen-error" ] ||
+			cat "$TEMP_DIR/ssh-keygen-error" >&2
+		fail "could not export identity $HASH"
+	fi
+	archive_public_keys || fail 'could not preserve an exported public key'
+
+	find_exported_public_key
+	match_status=$?
+	case $match_status in
+		0) ;;
+		1) fail "SSH provider did not export identity $HASH" ;;
+		2) fail "SSH provider exported multiple entries for $SSH_FINGERPRINT" ;;
+		*) fail 'SSH provider returned an invalid public key' ;;
+	esac
+
+	cat "$TEMP_DIR/export-match"
 }
 
 if [ "$#" -eq 0 ]; then
