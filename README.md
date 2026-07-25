@@ -1,5 +1,7 @@
 # sekey.sh
 
+<p align="center"><img src="./access-ssh-key-confirmation.png" width=372 /></p>
+
 A shell script for managing SSH keypairs stored in Apple Secure Enclave. Inspired by
 [SeKey](https://github.com/sekey/sekey).
 
