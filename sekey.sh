@@ -235,19 +235,21 @@ delete_keypair() {
 	capture_identities || exit $?
 
 	if ! find_identity non-exportable; then
-		fail "no non-exportable identity found for hash $HASH"
+		fail "no non-exportable keypair found for hash $HASH"
 	fi
 
 	build_identity_map || :
-	printf 'Identity to delete permanently:\n' >&2
-	cat "$TEMP_DIR/match" >&2
 	match_type=$(awk 'NR == 1 { print $1 }' "$TEMP_DIR/match")
+	match_label=$(awk 'NR == 1 { print $4 }' "$TEMP_DIR/match")
+	printf 'Keypair to delete permanently:\n' >&2
+	printf 'Hash: %s\n' "$HASH" >&2
+	printf 'Label: %s\n' "$match_label" >&2
 	if [ "$match_type" = p-256-ne ] && find_ssh_fingerprint; then
-		printf 'SSH fingerprint: %s\n' "$SSH_FINGERPRINT" >&2
+		printf 'Fingerprint: %s\n' "$SSH_FINGERPRINT" >&2
 	elif [ "$match_type" = p-256-ne ]; then
-		printf 'SSH fingerprint: unavailable\n' >&2
+		printf 'Fingerprint: unavailable\n' >&2
 	else
-		printf 'SSH fingerprint: unavailable (not SSH-compatible)\n' >&2
+		printf 'Fingerprint: unavailable (not SSH-compatible)\n' >&2
 	fi
 	if ! printf "Type 'delete' to continue: " >/dev/tty 2>/dev/null; then
 		fail 'deletion requires an interactive terminal'
@@ -263,12 +265,12 @@ delete_keypair() {
 	"$SC_AUTH" delete-ctk-identity -h "$HASH"
 	delete_status=$?
 	if [ "$delete_status" -eq 0 ]; then
-		printf 'Deleted identity %s.\n' "$HASH" >&2
+		printf 'Deleted keypair %s.\n' "$HASH" >&2
 		printf 'If it was loaded in ssh-agent, its stale entry may remain until the agent is refreshed.\n' >&2
 		return 0
 	fi
 
-	error "could not delete identity $HASH"
+	error "could not delete keypair $HASH"
 	return "$delete_status"
 }
 
