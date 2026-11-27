@@ -1,6 +1,7 @@
 #!/bin/sh
 
 PROGRAM=${0##*/}
+VERSION=0.1.1
 PROVIDER=/usr/lib/ssh-keychain.dylib
 SC_AUTH=/usr/sbin/sc_auth
 SSH_ADD=/usr/bin/ssh-add
@@ -18,6 +19,7 @@ Manage non-exportable SSH keypairs in Apple Secure Enclave.
 
 Options:
   -h, --help                    Show this help
+      --version                 Show program version
   -l, --list-keys               List SSH keypairs in Apple Secure Enclave
   -c, --generate-keypair LABEL  Generate a Touch ID-protected keypair
   -d, --delete-keypair HASH     Delete a keypair after confirmation
@@ -25,7 +27,12 @@ Options:
   -a, --add-to-agent            Add all SSH-compatible keypairs to ssh-agent
 
 HASH is the 40-character public key hash shown by --list-keys, is used in
---delete-keypair, --export. Requires macOS 26 or newer. Do not run with sudo.
+--delete-keypair, --export-key.
+
+Requires macOS 26 or newer. Do not run with sudo.
+
+Version:
+  $PROGRAM $VERSION
 EOF
 }
 
@@ -294,6 +301,8 @@ count_overwrite_prompts() {
 }
 
 archive_public_keys() {
+	# Collect every filename: fixed providers export distinct names (FB21992630).
+	# Older providers reuse id_ecdsa_sk_rk; archive before each overwrite.
 	set -- "$TEMP_DIR/export"/*.pub
 	[ -f "$1" ] || return 0
 
@@ -428,6 +437,10 @@ case $OPTION in
 	-h | --help)
 		[ "$#" -eq 0 ] || usage_error 'help does not accept arguments'
 		usage
+		;;
+	--version)
+		[ "$#" -eq 0 ] || usage_error 'version does not accept arguments'
+		printf '%s %s\n' "$PROGRAM" "$VERSION"
 		;;
 	-l | --list-keys)
 		[ "$#" -eq 0 ] || usage_error 'list-keys does not accept arguments'
