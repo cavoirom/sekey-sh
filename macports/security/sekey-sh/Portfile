@@ -1,0 +1,38 @@
+# -*- coding: utf-8; mode: tcl; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- vim:fenc=utf-8:ft=tcl:et:sw=4:ts=4:sts=4
+
+PortSystem          1.0
+PortGroup           github 1.0
+
+github.setup        cavoirom sekey-sh 0.1.1
+github.tarball_from archive
+revision            0
+
+categories          security
+platforms           {darwin >= 25}
+supported_archs     noarch
+license             public-domain
+maintainers         {@cavoirom} openmaintainer
+
+description         Manage SSH keypairs stored in Apple Secure Enclave
+
+long_description    sekey.sh creates non-exportable, Touch ID-protected SSH \
+                    keypairs in the Apple Secure Enclave, lists and deletes \
+                    them, exports their public keys, and adds them to \
+                    ssh-agent. It requires macOS 26 or newer.
+
+checksums           rmd160  d77a7dd22597a8edab583869834e055ef2fe9694 \
+                    sha256  0b380947827ff2029ef28246ba4ffeb080b5ddc29925beb55f65dc278e1cd83e \
+                    size    190161
+
+use_configure       no
+
+build {}
+
+destroot {
+    xinstall -m 0755 ${worksrcpath}/sekey.sh ${destroot}${prefix}/bin/sekey.sh
+}
+
+notes "
+After creating keypairs, run 'sekey.sh -a' to add them to ssh-agent.
+Do not run sekey.sh with sudo.
+"
