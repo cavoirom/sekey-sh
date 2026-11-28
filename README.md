@@ -14,11 +14,25 @@ Worked on:
 
 ## Installation
 
+### Use the script directly
+
 Take the [sekey.sh](./sekey.sh) and run it on your terminal. You can put its location in `$PATH` to
 run it anywhere without the full path.
 
-After created the keypairs, we must add the identities to current SSH agent for authentication, by
-this command: `./sekey.sh -a`.
+### MacPorts
+
+Put the port inside `./macports/` to local ports tree, then install:
+
+```
+port install sekey-sh
+```
+
+### Homebrew
+
+```
+brew tap cavoirom/sekey-sh https://github.com/cavoirom/sekey-sh
+brew install cavoirom/sekey-sh/sekey-sh
+```
 
 ## Usage
 
